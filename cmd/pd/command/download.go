@@ -12,9 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"filippo.io/age"
 	"github.com/AlecAivazis/survey/v2"
@@ -48,7 +50,65 @@ func downloadURL(ctx *cli.Context, url, dir string, identities []age.Identity) e
 	return download(ctx, res.Payload, dir, identities)
 }
 
+// withRetry wraps a function with retry logic
+func withRetry(ctx *cli.Context, fn func() error) error {
+	retries := ctx.Int("retries")
+	var lastErr error
+
+	for attempt := 0; attempt <= retries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 1s, 2s, 4s, 8s
+			delay := time.Duration(math.Pow(2, float64(attempt-1))) * time.Second
+			fmt.Fprintf(ctx.App.ErrWriter, "Retrying in %v (attempt %d/%d)...\n", delay, attempt, retries)
+			time.Sleep(delay)
+		}
+
+		err := fn()
+		if err == nil {
+			return nil // Success
+		}
+
+		lastErr = err
+
+		// Don't retry 4xx client errors
+		if isClientError(err) {
+			return err
+		}
+
+		// Log error for non-final attempts
+		if attempt < retries {
+			fmt.Fprintf(ctx.App.ErrWriter, "Download failed: %v\n", err)
+		}
+	}
+
+	return lastErr
+}
+
+// isClientError checks if error is a 4xx status that shouldn't be retried
+func isClientError(err error) bool {
+	if pdErr, ok := err.(*pixeldrain.Error); ok {
+		err = pdErr.Unwrap()
+	}
+
+	if codeErr, ok := err.(interface{ Code() int }); ok {
+		code := codeErr.Code()
+		return code >= 400 && code < 500
+	}
+
+	if clientErr, ok := err.(interface{ IsClientError() bool }); ok {
+		return clientErr.IsClientError()
+	}
+
+	return false
+}
+
 func download(ctx *cli.Context, info *models.FileInfo, dir string, identities []age.Identity) error {
+	return withRetry(ctx, func() error {
+		return downloadOnce(ctx, info, dir, identities)
+	})
+}
+
+func downloadOnce(ctx *cli.Context, info *models.FileInfo, dir string, identities []age.Identity) error {
 	var encrypted bool
 	if strings.HasSuffix(info.Name, AgeExt) && len(identities) != 0 {
 		info.Name = strings.TrimSuffix(info.Name, AgeExt)
