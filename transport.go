@@ -33,11 +33,11 @@ type idleTimeoutBody struct {
 	ctx      context.Context
 	cancel   context.CancelCauseFunc
 	mu       sync.Mutex
-	done     chan struct{}
+	wg       sync.WaitGroup
 	closed   bool
 
 	// Channels for read operations
-	readReq  chan<- readRequest // Bidirectional channel for requests
+	readReq  chan<- readRequest // Send-only for sending requests
 	readResp <-chan readResult  // Read-only for receiving responses
 }
 
@@ -55,7 +55,7 @@ func newIdleTimeoutBody(body io.ReadCloser, timeout time.Duration, parentCtx con
 
 	// Create bidirectional channels
 	reqCh := make(chan readRequest)
-	respCh := make(chan readResult)
+	respCh := make(chan readResult, 1)  // Buffered to prevent deadlock
 
 	itb := &idleTimeoutBody{
 		body:     body,
@@ -63,11 +63,11 @@ func newIdleTimeoutBody(body io.ReadCloser, timeout time.Duration, parentCtx con
 		ctx:      ctx,
 		cancel:   cancel,
 		lastRead: time.Now(),
-		done:     make(chan struct{}),
 		closed:   false,
-		readReq:  reqCh,  // Bidirectional channel
+		readReq:  reqCh,  // Send-only channel
 		readResp: respCh, // Read-only channel
 	}
+	itb.wg.Add(2) // Two goroutines: monitor and readWorker
 	go itb.monitor()
 	go itb.readWorker(reqCh, respCh)
 
@@ -76,6 +76,7 @@ func newIdleTimeoutBody(body io.ReadCloser, timeout time.Duration, parentCtx con
 
 func (itb *idleTimeoutBody) readWorker(reqCh <-chan readRequest, respCh chan<- readResult) {
 	defer close(respCh)
+	defer itb.wg.Done() // Signal completion
 
 	for {
 		select {
@@ -143,13 +144,14 @@ func (itb *idleTimeoutBody) Close() error {
 	itb.cancel(ErrorUserCancelled)
 	close(itb.readReq)
 
-	// Wait for goroutine to finish
-	<-itb.done
+	// Wait for goroutines to finish
+	itb.wg.Wait()
 
 	return itb.body.Close()
 }
 
 func (itb *idleTimeoutBody) monitor() {
+	defer itb.wg.Done() // Signal completion
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
@@ -163,8 +165,8 @@ func (itb *idleTimeoutBody) monitor() {
 				return
 			}
 			itb.mu.Unlock()
-		case <-itb.done:
-			// Request completed, stop monitoring
+		case <-itb.ctx.Done():
+			// Context cancelled, stop monitoring
 			return
 		}
 	}
