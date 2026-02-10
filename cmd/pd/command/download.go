@@ -9,6 +9,7 @@
 package command
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -90,6 +91,19 @@ func isClientError(err error) bool {
 		err = pdErr.Unwrap()
 	}
 
+	// Don't retry context cancellation (user interruption)
+	// But do retry idle timeouts which are network issues
+	if errors.Is(err, context.Canceled) {
+		// Check if it's our idle timeout, which should be retried
+		var pdErr *pixeldrain.Error
+		if errors.As(err, &pdErr) {
+			if errors.Is(pdErr.Unwrap(), pixeldrain.ErrIdleTimeout) {
+				return false // Retry idle timeouts
+			}
+		}
+		return true // Don't retry other cancellations
+	}
+
 	if codeErr, ok := err.(interface{ Code() int }); ok {
 		code := codeErr.Code()
 		return code >= 400 && code < 500
@@ -158,8 +172,12 @@ func downloadOnce(ctx *cli.Context, info *models.FileInfo, dir string, identitie
 	bar.Start()
 	defer bar.Finish()
 
+	// Create context with cancellation for timeout handling
+	downloadCtx, cancel := context.WithCancel(ctx.Context)
+	defer cancel()
+
 	// Prepare download parameters
-	params := file.NewDownloadFileParamsWithContext(ctx.Context).WithID(swag.StringValue(info.ID))
+	params := file.NewDownloadFileParamsWithContext(downloadCtx).WithID(swag.StringValue(info.ID))
 
 	// Set Range header if resuming
 	if resumeFrom > 0 {
@@ -169,7 +187,7 @@ func downloadOnce(ctx *cli.Context, info *models.FileInfo, dir string, identitie
 
 	_, _, err = pixeldrain.Default.File.DownloadFile(
 		params,
-		auth.Extract(ctx.Context),
+		auth.Extract(downloadCtx),
 		bar.NewProxyWriter(w),
 	)
 	if err != nil {
