@@ -22,6 +22,9 @@ import (
 // ErrIdleTimeout is returned when a download stalls due to idle timeout
 var ErrIdleTimeout = errors.New("download stalled: no data received for timeout duration")
 
+// ErrorUserCancelled is returned when a user cancels an operation
+var ErrorUserCancelled = errors.New("operation cancelled by user")
+
 // idleTimeoutBody wraps a response body to detect read timeouts
 type idleTimeoutBody struct {
 	body     io.ReadCloser
@@ -31,10 +34,29 @@ type idleTimeoutBody struct {
 	cancel   context.CancelCauseFunc
 	mu       sync.Mutex
 	done     chan struct{}
+	closed   bool
+
+	// Channels for read operations
+	readReq  chan<- readRequest // Bidirectional channel for requests
+	readResp <-chan readResult  // Read-only for receiving responses
+}
+
+type readRequest struct {
+	buf []byte
+}
+
+type readResult struct {
+	n   int
+	err error
 }
 
 func newIdleTimeoutBody(body io.ReadCloser, timeout time.Duration, parentCtx context.Context) *idleTimeoutBody {
 	ctx, cancel := context.WithCancelCause(parentCtx)
+
+	// Create bidirectional channels
+	reqCh := make(chan readRequest)
+	respCh := make(chan readResult)
+
 	itb := &idleTimeoutBody{
 		body:     body,
 		timeout:  timeout,
@@ -42,34 +64,88 @@ func newIdleTimeoutBody(body io.ReadCloser, timeout time.Duration, parentCtx con
 		cancel:   cancel,
 		lastRead: time.Now(),
 		done:     make(chan struct{}),
+		closed:   false,
+		readReq:  reqCh,  // Bidirectional channel
+		readResp: respCh, // Read-only channel
 	}
 	go itb.monitor()
+	go itb.readWorker(reqCh, respCh)
 
 	return itb
 }
 
+func (itb *idleTimeoutBody) readWorker(reqCh <-chan readRequest, respCh chan<- readResult) {
+	defer close(respCh)
+
+	for {
+		select {
+		case req, ok := <-reqCh:
+			if !ok {
+				// Channel closed, exit worker
+				return
+			}
+			n, err := itb.body.Read(req.buf)
+			select {
+			case respCh <- readResult{n: n, err: err}:
+				// Response sent successfully
+			case <-itb.ctx.Done():
+				// Context cancelled, stop worker
+				return
+			}
+		case <-itb.ctx.Done():
+			return
+		}
+	}
+}
+
 func (itb *idleTimeoutBody) Read(p []byte) (n int, err error) {
-	// Check if context was cancelled
+	// Check if context was cancelled first
 	if err := context.Cause(itb.ctx); err != nil {
 		return 0, err
 	}
 
-	itb.mu.Lock()
-	n, err = itb.body.Read(p)
-	if n > 0 {
-		itb.lastRead = time.Now()
+	// Send read request
+	select {
+	case itb.readReq <- readRequest{buf: p}:
+		// Request sent successfully
+	case <-itb.ctx.Done():
+		return 0, context.Cause(itb.ctx)
 	}
-	itb.mu.Unlock()
-	return n, err
+
+	// Wait for response
+	select {
+	case result, ok := <-itb.readResp:
+		if !ok {
+			// Channel closed due to context cancellation
+			return 0, context.Cause(itb.ctx)
+		}
+		if result.n > 0 {
+			itb.mu.Lock()
+			itb.lastRead = time.Now()
+			itb.mu.Unlock()
+		}
+		return result.n, result.err
+	case <-itb.ctx.Done():
+		return 0, context.Cause(itb.ctx)
+	}
 }
 
 func (itb *idleTimeoutBody) Close() error {
-	select {
-	case <-itb.done:
-		// Already closed
-	default:
-		close(itb.done)
+	itb.mu.Lock()
+	defer itb.mu.Unlock()
+
+	if itb.closed {
+		return nil
 	}
+	itb.closed = true
+
+	// Cancel context and close channels
+	itb.cancel(ErrorUserCancelled)
+	close(itb.readReq)
+
+	// Wait for goroutine to finish
+	<-itb.done
+
 	return itb.body.Close()
 }
 

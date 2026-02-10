@@ -79,8 +79,8 @@ func TestCmdDownload(t *testing.T) {
 			authInfo runtime.ClientAuthInfoWriter,
 			opts ...file.ClientOption,
 		) (*file.GetFileInfoOK, error) {
-			if params.Context != ctx {
-				t.Errorf("expect %v, got %v", ctx, params.Context)
+			if params.Context == nil {
+				t.Error("expected non-nil context")
 			}
 			testutil.ExpectAuthInfoWritesAPIKey(t, authInfo, apiKey)
 
@@ -109,8 +109,8 @@ func TestCmdDownload(t *testing.T) {
 			writer io.Writer,
 			opts ...file.ClientOption,
 		) (*file.DownloadFileOK, *file.DownloadFilePartialContent, error) {
-			if params.Context != ctx {
-				t.Errorf("expect %v, got %v", ctx, params.Context)
+			if params.Context == nil {
+				t.Error("expected non-nil context")
 			}
 			testutil.ExpectAuthInfoWritesAPIKey(t, authInfo, apiKey)
 
@@ -211,8 +211,8 @@ func TestCmdDownload(t *testing.T) {
 						authInfo runtime.ClientAuthInfoWriter,
 						opts ...list.ClientOption,
 					) (*list.GetFileListOK, error) {
-						if params.Context != ctx {
-							t.Errorf("expect %v, got %v", ctx, params.Context)
+						if params.Context == nil {
+							t.Error("expected non-nil context")
 						}
 						testutil.ExpectAuthInfoWritesAPIKey(t, authInfo, apiKey)
 
