@@ -9,10 +9,37 @@
 package pixeldrain
 
 import (
+	"io"
 	"net/http"
+	"time"
 
 	"github.com/go-openapi/runtime"
 )
+
+const stuckReaderDuration = 30 * time.Second
+
+type ErrorOnStuckReader struct {
+	r        io.ReadCloser
+	lastRead time.Time
+}
+
+var _ io.ReadCloser = (*ErrorOnStuckReader)(nil)
+
+func (r *ErrorOnStuckReader) Read(p []byte) (int, error) {
+	if time.Since(r.lastRead) > stuckReaderDuration {
+		return 0, io.ErrNoProgress
+	}
+
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.lastRead = time.Now()
+	}
+	return n, err
+}
+
+func (r *ErrorOnStuckReader) Close() error {
+	return r.r.Close()
+}
 
 // roundTripper is a http.RoundTripper that forwards a request to the upstream and fixes content type header of the
 // corresponding response.
@@ -41,6 +68,10 @@ func (t *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if res.StatusCode < 300 {
 		res.Header.Set(runtime.HeaderContentType, t.contentType)
 	}
+
+	if res.StatusCode >= 200 && res.StatusCode < 300 {
+		res.Body = &ErrorOnStuckReader{r: res.Body, lastRead: time.Now()}
+	}
 	return res, nil
 }
 
@@ -58,7 +89,7 @@ func ContentTypeFixer(upstream runtime.ClientTransport) runtime.ClientTransport 
 }
 
 // Submit sends the given operation and returns a response.
-func (t *transport) Submit(op *runtime.ClientOperation) (interface{}, error) {
+func (t *transport) Submit(op *runtime.ClientOperation) (any, error) {
 	if op.Client == nil {
 		op.Client = &http.Client{
 			Transport: http.DefaultTransport,
