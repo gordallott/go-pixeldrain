@@ -95,6 +95,9 @@ func (t *transport) Submit(op *runtime.ClientOperation) (any, error) {
 			Transport: http.DefaultTransport,
 		}
 	}
-	op.Client.Transport = newRoundTripper(op.Client.Transport, op.ProducesMediaTypes[0])
+
+	contentTypeTransport := newRoundTripper(op.Client.Transport, op.ProducesMediaTypes[0])
+
+	op.Client.Transport = contentTypeTransport
 	return t.upstream.Submit(op)
 }

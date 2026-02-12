@@ -97,6 +97,11 @@ var Commands = []*cli.Command{
 				Category: "End-to-end encryption",
 				Usage:    "Use the identity file at `PATH`.",
 			},
+			&cli.IntFlag{
+				Name:  "retries",
+				Value: 0,
+				Usage: "number of retries for failed downloads (0 = no retries)",
+			},
 		},
 	},
 }

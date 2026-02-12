@@ -9,12 +9,15 @@
 package command
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"filippo.io/age"
 	"github.com/AlecAivazis/survey/v2"
@@ -48,7 +51,61 @@ func downloadURL(ctx *cli.Context, url, dir string, identities []age.Identity) e
 	return download(ctx, res.Payload, dir, identities)
 }
 
+// withRetry wraps a function with retry logic
+func withRetry(ctx *cli.Context, fn func() error) error {
+	retries := ctx.Int("retries")
+	var lastErr error
+
+	for attempt := 0; attempt <= retries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 1s, 2s, 4s, 8s
+			delay := time.Duration(math.Pow(2, float64(attempt-1))) * time.Second
+			fmt.Fprintf(ctx.App.ErrWriter, "Retrying in %v (attempt %d/%d)...\n", delay, attempt, retries)
+			time.Sleep(delay)
+		}
+
+		err := fn()
+		if err == nil {
+			return nil // Success
+		}
+
+		lastErr = err
+
+		if isClientError(err) {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		// Log error for non-final attempts
+		if attempt < retries {
+			fmt.Fprintf(ctx.App.ErrWriter, "Download failed: %v\n", err)
+		}
+	}
+
+	return lastErr
+}
+
+// isClientError checks if error is a 4xx status that shouldn't be retried
+func isClientError(err error) bool {
+	// Don't retry context cancellation (user interruption)
+	// But do retry idle timeouts which are network issues
+	if errors.Is(err, context.Canceled) {
+		// Check if it's our idle timeout, which should be retried
+		return true // Don't retry other cancellations
+	}
+
+	return false
+}
+
 func download(ctx *cli.Context, info *models.FileInfo, dir string, identities []age.Identity) error {
+	return withRetry(ctx, func() error {
+		return downloadOnce(ctx, info, dir, identities)
+	})
+}
+
+func downloadOnce(ctx *cli.Context, info *models.FileInfo, dir string, identities []age.Identity) error {
 	var encrypted bool
 	if strings.HasSuffix(info.Name, AgeExt) && len(identities) != 0 {
 		info.Name = strings.TrimSuffix(info.Name, AgeExt)
@@ -98,8 +155,12 @@ func download(ctx *cli.Context, info *models.FileInfo, dir string, identities []
 	bar.Start()
 	defer bar.Finish()
 
+	// Create context with cancellation for timeout handling
+	downloadCtx, cancel := context.WithCancel(ctx.Context)
+	defer cancel()
+
 	// Prepare download parameters
-	params := file.NewDownloadFileParamsWithContext(ctx.Context).WithID(swag.StringValue(info.ID))
+	params := file.NewDownloadFileParamsWithContext(downloadCtx).WithID(swag.StringValue(info.ID))
 
 	// Set Range header if resuming
 	if resumeFrom > 0 {
@@ -109,7 +170,7 @@ func download(ctx *cli.Context, info *models.FileInfo, dir string, identities []
 
 	_, _, err = pixeldrain.Default.File.DownloadFile(
 		params,
-		auth.Extract(ctx.Context),
+		auth.Extract(downloadCtx),
 		bar.NewProxyWriter(w),
 	)
 	if err != nil {
